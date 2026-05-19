@@ -1,0 +1,42 @@
+# Render Blueprint — one-click deploy of the Versa Ledger backend + Postgres.
+# To use: push this repo to GitHub, then on Render → New → Blueprint → point
+# at the repo. Render reads this file and provisions both services together.
+#
+# Free tier notes:
+#  - The web service sleeps after 15min idle; first request after sleep takes
+#    30-60s. Upgrade to paid ($7/mo) for always-on.
+#  - Postgres free tier expires after 90 days. Upgrade before then ($7/mo).
+#
+# All env vars except the auto-injected DATABASE_URL must be set in Render's
+# dashboard after the first deploy (or here, but committing secrets is bad).
+
+services:
+  - type: web
+    name: versa-ledger-api
+    env: python
+    region: oregon              # match your existing platform's region if possible
+    plan: free                  # upgrade to 'starter' ($7/mo) for production
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 90
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL       # auto-injected from the database below
+        fromDatabase:
+          name: versa-ledger-db
+          property: connectionString
+      - key: EXISTING_PLATFORM_URL
+        value: https://versa-inventory-api.onrender.com
+      - key: RESET_PASSWORD
+        sync: false              # set in Render dashboard — do NOT commit
+      - key: ALLOWED_ORIGINS
+        value: https://rossversacatalog.com,https://app.rossversacatalog.com,https://www.rossversacatalog.com
+      - key: API_BEARER_TOKEN
+        sync: false              # optional — set if you want bearer-token auth
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+databases:
+  - name: versa-ledger-db
+    region: oregon
+    plan: free                   # upgrade to 'starter' ($7/mo) for production
+    postgresMajorVersion: 16
