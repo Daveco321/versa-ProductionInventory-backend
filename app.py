@@ -75,6 +75,13 @@ EXISTING_PLATFORM_URL = os.environ.get(
     'EXISTING_PLATFORM_URL',
     'https://versa-inventory-api.onrender.com'
 ).rstrip('/')
+# Separate service that exposes Ross's forward-looking open orders.
+# Note: this service has a hostname allowlist — your backend's Render domain
+# may need to be added on their end for the sync to succeed.
+OPEN_ORDERS_API_URL = os.environ.get(
+    'OPEN_ORDERS_API_URL',
+    'https://open-orders-api.onrender.com'
+).rstrip('/')
 RESET_PASSWORD = os.environ.get('RESET_PASSWORD', 'Versa1211')
 
 # CORS: comma-separated origins, or '*' for any (NOT recommended in prod).
@@ -289,6 +296,45 @@ class Production(Base):
         }
 
 
+class OpenOrder(Base):
+    """
+    View-only mirror of the open-orders-api service. One row per order line.
+
+    Why a separate table from Allocation: open orders are forward-looking
+    demand (the retailer has placed an order, may be on pick, may still be
+    open) and have date semantics. Allocations are about deductions against
+    the current ATS. The existing platform shows both side-by-side in its
+    deductions popup ("A2000 Breakdown" — image 3 from the user).
+
+    Source URL: https://open-orders-api.onrender.com/api/orders
+    Field-name fallbacks for `po` and `style` mirror the existing platform's
+    multi-key handling (see app__19_.py:6633 — `po | poNumber | customerPO | orderNo | ctrlNo`).
+    """
+    __tablename__ = 'open_orders'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    style = Column(String(64), nullable=False, index=True)      # base style (no size suffix)
+    customer = Column(String(64), nullable=True, index=True)
+    po = Column(String(128), nullable=True)
+    open_qty = Column(Integer, nullable=False, default=0)        # not yet picked
+    pick_qty = Column(Integer, nullable=False, default=0)        # already on pick (shows "ON PICK" badge)
+    start_date = Column(String(32), nullable=True)               # earliest ship date (string — format varies upstream)
+    cancel_date = Column(String(32), nullable=True)              # latest acceptable ship date
+    synced_at = Column(DateTime(timezone=True), default=func.now())
+
+    def to_dict(self):
+        return {
+            'style': self.style,
+            'customer': self.customer or '',
+            'po': self.po or '',
+            'openQty': self.open_qty,
+            'pickQty': self.pick_qty,
+            'totalQty': (self.open_qty or 0) + (self.pick_qty or 0),
+            'startDate': self.start_date,
+            'cancelDate': self.cancel_date,
+            'onPick': (self.pick_qty or 0) > 0,
+        }
+
+
 class SyncLog(Base):
     """
     Tracks the most recent run of each sync source. Singleton-per-source: we
@@ -388,7 +434,7 @@ def _maybe_lazy_sync():
     global _sync_in_flight
     if _sync_in_flight:
         return
-    needed_sources = ['inventory_committed', 'allocations', 'productions']
+    needed_sources = ['inventory_committed', 'allocations', 'productions', 'open_orders']
     now = dt.datetime.utcnow()
     needs = False
     for src in needed_sources:
@@ -550,6 +596,66 @@ def run_full_sync():
         db_session.rollback()
         _stamp_sync('productions', 'error', error=str(e))
         log.error(f'  ✗ productions sync failed: {e}')
+
+    # 4. /api/orders from open-orders-api — Ross's forward-looking demand.
+    # Different host than the existing platform — its own Render service.
+    # If that service blocks us with "Host not in allowlist", it's a hostname
+    # allowlist issue on their end (add this backend's domain to their allowlist).
+    try:
+        oo_url = OPEN_ORDERS_API_URL.rstrip('/') + '/api/orders'
+        r = requests.get(oo_url, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        rows = data.get('orders') or data if isinstance(data, list) else []
+        OpenOrder.query.delete()
+        now = dt.datetime.utcnow()
+        added = 0
+        skipped = 0
+        for o in rows:
+            # The open-orders API may return `style` or `baseStyle`. Both can be
+            # full SKUs (with size suffix) so we strip to the base style.
+            raw_style = str(o.get('style', '') or o.get('baseStyle', '') or '').upper().strip()
+            if not raw_style:
+                skipped += 1
+                continue
+            base_style = raw_style.split('-')[0]
+            try:
+                open_qty = int(o.get('openQty') or 0)
+            except (ValueError, TypeError):
+                open_qty = 0
+            try:
+                pick_qty = int(o.get('pickQty') or 0)
+            except (ValueError, TypeError):
+                pick_qty = 0
+            # Skip empty rows so the table doesn't bloat with 0-qty noise
+            if open_qty == 0 and pick_qty == 0:
+                skipped += 1
+                continue
+            # PO identifier: existing platform tries 5 different keys, mirror that
+            po = (o.get('po') or o.get('poNumber') or o.get('customerPO')
+                  or o.get('orderNo') or o.get('ctrlNo') or '')
+            customer = (o.get('customer') or '').strip()
+            # Date fields — multiple aliases as in existing platform
+            start = o.get('startDate') or o.get('start_date') or o.get('shipDate')
+            cancel = o.get('cancelDate') or o.get('cancel_date') or o.get('endDate')
+            db_session.add(OpenOrder(
+                style=base_style[:64],
+                customer=customer[:64] if customer else None,
+                po=str(po)[:128] if po else None,
+                open_qty=open_qty,
+                pick_qty=pick_qty,
+                start_date=str(start)[:32] if start else None,
+                cancel_date=str(cancel)[:32] if cancel else None,
+                synced_at=now,
+            ))
+            added += 1
+        db_session.commit()
+        _stamp_sync('open_orders', 'ok', rows=added)
+        log.info(f'  ✓ open_orders: {added} rows replaced ({skipped} skipped as empty)')
+    except Exception as e:
+        db_session.rollback()
+        _stamp_sync('open_orders', 'error', error=str(e))
+        log.error(f'  ✗ open_orders sync failed: {e}')
 
 
 def init_db_post():
@@ -1060,6 +1166,64 @@ def get_productions_for_style(style):
         'style': base,
         'productions': filtered,
         'totalUnits': sum(r.get('units', 0) for r in filtered),
+    })
+
+
+@app.route('/open-orders/<style>', methods=['GET'])
+@require_auth
+def get_open_orders_for_style(style):
+    """
+    Return open-order rows for a given base style, plus pre-aggregated
+    per-customer totals (the data the "A2000 Breakdown" view needs).
+    """
+    base = style.strip().upper().split('-')[0]
+    # All rows are stored at the base-style level (we strip size during sync)
+    rows = OpenOrder.query.filter(OpenOrder.style == base).all()
+    raw = [r.to_dict() for r in rows]
+
+    # Aggregate by customer for the breakdown card (one row per customer)
+    by_customer = {}
+    for r in raw:
+        cust = r.get('customer') or '—'
+        cur = by_customer.setdefault(cust, {
+            'customer': cust,
+            'openQty': 0,
+            'pickQty': 0,
+            'totalQty': 0,
+            'pos': set(),
+            'startDate': None,    # earliest startDate across this customer's POs
+            'cancelDate': None,   # earliest cancelDate
+            'onPick': False,
+        })
+        cur['openQty'] += r.get('openQty', 0)
+        cur['pickQty'] += r.get('pickQty', 0)
+        cur['totalQty'] += r.get('totalQty', 0)
+        if r.get('onPick'):
+            cur['onPick'] = True
+        if r.get('po'):
+            cur['pos'].add(r.get('po'))
+        # Track date range — keep earliest start and earliest cancel
+        sd = r.get('startDate')
+        if sd and (cur['startDate'] is None or sd < cur['startDate']):
+            cur['startDate'] = sd
+        cd = r.get('cancelDate')
+        if cd and (cur['cancelDate'] is None or cd < cur['cancelDate']):
+            cur['cancelDate'] = cd
+
+    # Serialize sets and sort by total qty descending (biggest customer first)
+    by_customer_list = []
+    for v in by_customer.values():
+        v['pos'] = sorted(v['pos'])
+        by_customer_list.append(v)
+    by_customer_list.sort(key=lambda r: -r['totalQty'])
+
+    return jsonify({
+        'style': base,
+        'orders': raw,
+        'byCustomer': by_customer_list,
+        'totalQty': sum(r.get('totalQty', 0) for r in raw),
+        'totalOpenQty': sum(r.get('openQty', 0) for r in raw),
+        'totalPickQty': sum(r.get('pickQty', 0) for r in raw),
     })
 
 
