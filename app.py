@@ -523,19 +523,16 @@ def run_full_sync():
         r.raise_for_status()
         data = r.json()
         items = data.get('inventory') or data.get('items') or []
-        # Roll up to base styles using the SAME extraction logic as the frontend's
-        # extractBaseStyle() — strips both dashed sizes (FOO-XL) and run-together
-        # sizes (FOOXL). Earlier versions of this code used split('-')[0] which
-        # silently kept run-together sizes intact, so deductions ended up stored
-        # against keys that didn't exist in the ledger.
-        rolled = {}  # base_style -> {committed, allocated}
+        # Key committed/allocated by FULL SKU (no rollup). The frontend's seed
+        # also stores SKUs at the full upstream level (no extractBaseStyle), so
+        # both sides agree on what a "ledger row" is. If we rolled up here but
+        # the seed didn't, the sync would write to non-existent base-style keys
+        # and leave variant rows showing zero deductions forever.
+        per_sku = {}  # sku -> {committed, allocated}
         sample_skus_logged = 0
         for it in items:
             sku = str(it.get('sku', '')).strip().upper()
             if not sku:
-                continue
-            base = _extract_base_style(sku)
-            if not base:
                 continue
             # Defensive parsing: some sources return committed/allocated as strings
             try:
@@ -548,12 +545,12 @@ def run_full_sync():
                 allocated = abs(int(float(allocated_raw or 0)))
             except (ValueError, TypeError):
                 allocated = 0
-            cur = rolled.setdefault(base, {'committed': 0, 'allocated': 0})
+            cur = per_sku.setdefault(sku, {'committed': 0, 'allocated': 0})
             cur['committed'] += committed
             cur['allocated'] += allocated
             # Log a few samples on each sync for debugging — visible in Render logs
             if sample_skus_logged < 3 and (committed > 0 or allocated > 0):
-                log.info(f'    sample: sku={sku!r} → base={base!r} committed={committed} allocated={allocated}')
+                log.info(f'    sample: sku={sku!r} committed={committed} allocated={allocated}')
                 sample_skus_logged += 1
         # Apply to ledger. Use db_session.get() (SQLAlchemy 2.0 API) instead of the
         # deprecated Query.get() — the legacy method can silently return None when
@@ -561,7 +558,7 @@ def run_full_sync():
         now = dt.datetime.utcnow()
         updated = 0
         missing_in_ledger = 0
-        for style, vals in rolled.items():
+        for style, vals in per_sku.items():
             row = db_session.get(Ledger, style)
             if row is None:
                 missing_in_ledger += 1
@@ -570,18 +567,18 @@ def run_full_sync():
             row.allocated = vals['allocated']
             row.committed_synced_at = now
             updated += 1
-        # Styles with NO committed/allocated in this response should reset to 0
-        styles_with_data = set(rolled.keys())
+        # SKUs with NO committed/allocated in this response should reset to 0
+        skus_with_data = set(per_sku.keys())
         for r2 in Ledger.query.filter((Ledger.committed > 0) | (Ledger.allocated > 0)).all():
-            if r2.style not in styles_with_data:
+            if r2.style not in skus_with_data:
                 r2.committed = 0
                 r2.allocated = 0
                 r2.committed_synced_at = now
                 updated += 1
         db_session.commit()
         _stamp_sync('inventory_committed', 'ok', rows=updated)
-        log.info(f'  ✓ inventory_committed: {updated} styles updated, '
-                 f'{missing_in_ledger} base styles in feed had no matching ledger row')
+        log.info(f'  ✓ inventory_committed: {updated} SKUs updated, '
+                 f'{missing_in_ledger} SKUs in feed had no matching ledger row')
     except Exception as e:
         db_session.rollback()
         _stamp_sync('inventory_committed', 'error', error=str(e))
