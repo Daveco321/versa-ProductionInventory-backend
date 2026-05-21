@@ -1225,19 +1225,49 @@ def trigger_sync():
 @require_auth
 def get_allocations_for_style(style):
     """
-    Return per-customer allocation breakdown for a given base style.
-    Uses _extract_base_style() so callers can pass either base or full SKUs.
+    Return per-customer allocation breakdown for a given SKU.
+
+    The lookup is permissive: matches BOTH the exact SKU as provided AND any
+    SKU whose base style equals the caller's base. Mirrors the same approach
+    used by /open-orders/<style>. This handles the case where the upstream
+    allocations CSV uses a slightly different SKU key than our ledger uses.
     """
-    base = _extract_base_style(style)
-    # Match SKUs whose base style equals `base`. Indexed via the sku column.
-    rows = Allocation.query.filter(Allocation.sku.like(f'{base}%')).all()
-    # Final filter in Python — handles edge cases where SKU starts with `base`
-    # but isn't actually the same base style (rare but possible).
-    filtered = [r.to_dict() for r in rows if _extract_base_style(r.sku) == base]
-    # Pull the ledger row to also include current committed/allocated totals
-    ledger_row = db_session.get(Ledger, base)
+    requested = style.strip().upper()
+    base = _extract_base_style(requested) or requested
+
+    # Two-pass match: exact OR same base style
+    exact = Allocation.query.filter(Allocation.sku == requested).all()
+    prefix = Allocation.query.filter(Allocation.sku.like(f'{base}%')).all()
+
+    seen_ids = set()
+    matched = []
+    for r in exact + prefix:
+        if r.id in seen_ids:
+            continue
+        seen_ids.add(r.id)
+        # For prefix matches, double-check base equality so we don't accidentally
+        # include neighboring styles (e.g. caller asked TJNASU201 but row is TJNASU2010).
+        if r.sku == requested or _extract_base_style(r.sku) == base:
+            matched.append(r)
+
+    filtered = [r.to_dict() for r in matched]
+
+    # Diagnostic: when the row count is zero but the ledger has nonzero totals,
+    # log the first few allocation rows in the DB so we can see what SKU format
+    # they use vs what we're looking up. This makes the SKU-mismatch class of
+    # bugs debuggable from Render logs alone.
+    ledger_row = db_session.get(Ledger, requested) or db_session.get(Ledger, base)
+    has_totals = ledger_row and ((ledger_row.committed or 0) + (ledger_row.allocated or 0)) > 0
+    if not filtered and has_totals:
+        sample = Allocation.query.limit(5).all()
+        sample_skus = [r.sku for r in sample]
+        log.warning(f'  /allocations/{requested}: no rows matched but ledger has '
+                    f'committed+allocated={(ledger_row.committed or 0) + (ledger_row.allocated or 0)}. '
+                    f'Looking for base={base!r}. Sample SKUs in allocations table: {sample_skus}')
+
     return jsonify({
-        'style': base,
+        'style': requested,
+        'baseStyle': base,
         'allocations': filtered,
         'totalAllocated': ledger_row.allocated if ledger_row else 0,
         'totalCommitted': ledger_row.committed if ledger_row else 0,
@@ -1261,6 +1291,53 @@ def get_productions_for_style(style):
         'productions': filtered,
         'totalUnits': sum(r.get('units', 0) for r in filtered),
     })
+
+
+@app.route('/sync/debug', methods=['GET'])
+@require_auth
+def sync_debug():
+    """
+    Diagnostic endpoint. Returns sample rows from each synced table so we can
+    inspect SKU format mismatches between the sync source and the ledger.
+
+    Query params:
+      ?style=<sku>  — also pull rows matching this style across all tables
+      ?n=<int>      — how many sample rows per table (default 10, max 100)
+    """
+    requested = (request.args.get('style') or '').strip().upper()
+    try:
+        n = min(int(request.args.get('n', 10)), 100)
+    except (ValueError, TypeError):
+        n = 10
+
+    out = {
+        'samples': {
+            'allocations': [r.to_dict() for r in Allocation.query.limit(n).all()],
+            'open_orders': [r.to_dict() for r in OpenOrder.query.limit(n).all()],
+            'productions': [r.to_dict() for r in Production.query.limit(n).all()],
+        },
+        'counts': {
+            'ledger': Ledger.query.count(),
+            'allocations': Allocation.query.count(),
+            'open_orders': OpenOrder.query.count(),
+            'productions': Production.query.count(),
+        },
+        'sync_log': {r.source: r.to_dict() for r in SyncLog.query.all()},
+    }
+
+    if requested:
+        base = _extract_base_style(requested) or requested
+        out['queryStyle'] = requested
+        out['queryBase'] = base
+        out['matching'] = {
+            'allocations_exact': [r.to_dict() for r in Allocation.query.filter(Allocation.sku == requested).limit(n).all()],
+            'allocations_prefix': [r.to_dict() for r in Allocation.query.filter(Allocation.sku.like(f'{base}%')).limit(n).all()],
+            'open_orders_exact': [r.to_dict() for r in OpenOrder.query.filter(OpenOrder.style == requested).limit(n).all()],
+            'open_orders_prefix': [r.to_dict() for r in OpenOrder.query.filter(OpenOrder.style.like(f'{base}%')).limit(n).all()],
+            'ledger_exact': db_session.get(Ledger, requested).to_dict() if db_session.get(Ledger, requested) else None,
+            'ledger_base':  db_session.get(Ledger, base).to_dict() if db_session.get(Ledger, base) else None,
+        }
+    return jsonify(out)
 
 
 @app.route('/open-orders/<style>', methods=['GET'])
