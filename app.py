@@ -411,6 +411,46 @@ SYNC_INTERVAL_SECONDS = 3600        # 1 hour
 _sync_in_flight = False             # crude lock to prevent concurrent sync runs
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Base-style extraction — MUST match the frontend's extractBaseStyle() exactly.
+# Frontend lives in index.html (search TRAILING_SIZE_RE). If you change one you
+# MUST change the other or the sync will store data against the wrong key and
+# committed/allocated will appear to be 0 in the UI (see Versa Ledger bug: ATS
+# = Units because deductions were stored against TJNASU201SLSXXL not TJNASU201SLS).
+# ──────────────────────────────────────────────────────────────────────────────
+import re as _re
+# Require a separator (space or dash) BEFORE the size. Without this, the regex
+# would also strip trailing letters that are part of the base style — e.g. it
+# would eat the "S" off KHNADS525SLS and turn it into KHNAD.
+_TRAILING_SIZE_RE = _re.compile(
+    r'[\s-](?:'
+    r'\d{1,3}(?:\.5)?(?:[-./]\d{1,3}(?:\.5)?)?'   # numeric sizes: 32, 32-33, 16.5/34, etc
+    r'|XXXL|XXL|XL|XS|2XL|3XL|4XL|S|M|L'           # alpha sizes
+    r'|SHORT|REGULAR|REG|LONG|TALL|BIG'            # length variants
+    r')$',
+    _re.IGNORECASE,
+)
+
+
+def _extract_base_style(raw):
+    """Strip the trailing size suffix from a SKU to get the base style.
+    Iterative because some SKUs have multiple suffixes (e.g. 'FOO-XL-LONG').
+    Mirrors the frontend's extractBaseStyle() in index.html — keep these in sync."""
+    if not raw:
+        return ''
+    s = str(raw).strip().upper()
+    if not s:
+        return ''
+    prev = None
+    guard = 0
+    while s != prev and guard < 8 and s:
+        prev = s
+        s = _TRAILING_SIZE_RE.sub('', s).strip()
+        guard += 1
+    # Strip trailing punctuation that might be left behind
+    return _re.sub(r'[,;\-\s]+$', '', s).strip()
+
+
 def _stamp_sync(source, status='ok', error=None, rows=0):
     """Upsert a row in sync_log."""
     row = SyncLog.query.get(source)
@@ -483,36 +523,54 @@ def run_full_sync():
         r.raise_for_status()
         data = r.json()
         items = data.get('inventory') or data.get('items') or []
-        # Roll up to base styles
+        # Roll up to base styles using the SAME extraction logic as the frontend's
+        # extractBaseStyle() — strips both dashed sizes (FOO-XL) and run-together
+        # sizes (FOOXL). Earlier versions of this code used split('-')[0] which
+        # silently kept run-together sizes intact, so deductions ended up stored
+        # against keys that didn't exist in the ledger.
         rolled = {}  # base_style -> {committed, allocated}
+        sample_skus_logged = 0
         for it in items:
             sku = str(it.get('sku', '')).strip().upper()
             if not sku:
                 continue
-            base = sku.split('-')[0]
-            committed_raw = it.get('committed', 0) or 0
-            allocated_raw = it.get('allocated', 0) or 0
-            # Existing platform sometimes signs these negative — abs() to normalize
-            committed = abs(int(committed_raw))
-            allocated = abs(int(allocated_raw))
+            base = _extract_base_style(sku)
+            if not base:
+                continue
+            # Defensive parsing: some sources return committed/allocated as strings
+            try:
+                committed_raw = it.get('committed', 0)
+                committed = abs(int(float(committed_raw or 0)))
+            except (ValueError, TypeError):
+                committed = 0
+            try:
+                allocated_raw = it.get('allocated', 0)
+                allocated = abs(int(float(allocated_raw or 0)))
+            except (ValueError, TypeError):
+                allocated = 0
             cur = rolled.setdefault(base, {'committed': 0, 'allocated': 0})
             cur['committed'] += committed
             cur['allocated'] += allocated
-        # Apply to ledger
+            # Log a few samples on each sync for debugging — visible in Render logs
+            if sample_skus_logged < 3 and (committed > 0 or allocated > 0):
+                log.info(f'    sample: sku={sku!r} → base={base!r} committed={committed} allocated={allocated}')
+                sample_skus_logged += 1
+        # Apply to ledger. Use db_session.get() (SQLAlchemy 2.0 API) instead of the
+        # deprecated Query.get() — the legacy method can silently return None when
+        # the session has uncommitted writes to other tables.
         now = dt.datetime.utcnow()
         updated = 0
+        missing_in_ledger = 0
         for style, vals in rolled.items():
-            row = Ledger.query.get(style)
+            row = db_session.get(Ledger, style)
             if row is None:
-                # Don't INSERT — only update existing ledger rows. Styles not in
-                # our ledger weren't seeded or aren't tracked here.
+                missing_in_ledger += 1
                 continue
             row.committed = vals['committed']
             row.allocated = vals['allocated']
             row.committed_synced_at = now
             updated += 1
         # Styles with NO committed/allocated in this response should reset to 0
-        # (in case they had values from a previous sync)
         styles_with_data = set(rolled.keys())
         for r2 in Ledger.query.filter((Ledger.committed > 0) | (Ledger.allocated > 0)).all():
             if r2.style not in styles_with_data:
@@ -522,11 +580,12 @@ def run_full_sync():
                 updated += 1
         db_session.commit()
         _stamp_sync('inventory_committed', 'ok', rows=updated)
-        log.info(f'  ✓ inventory_committed: {updated} styles updated')
+        log.info(f'  ✓ inventory_committed: {updated} styles updated, '
+                 f'{missing_in_ledger} base styles in feed had no matching ledger row')
     except Exception as e:
         db_session.rollback()
         _stamp_sync('inventory_committed', 'error', error=str(e))
-        log.error(f'  ✗ inventory_committed sync failed: {e}')
+        log.error(f'  ✗ inventory_committed sync failed: {e}', exc_info=True)
 
     # 2. /allocations — per-customer breakdown
     try:
@@ -618,7 +677,10 @@ def run_full_sync():
             if not raw_style:
                 skipped += 1
                 continue
-            base_style = raw_style.split('-')[0]
+            base_style = _extract_base_style(raw_style)
+            if not base_style:
+                skipped += 1
+                continue
             try:
                 open_qty = int(o.get('openQty') or 0)
             except (ValueError, TypeError):
@@ -1131,17 +1193,16 @@ def trigger_sync():
 def get_allocations_for_style(style):
     """
     Return per-customer allocation breakdown for a given base style.
-    The existing platform stores allocations at the full-SKU level — we filter
-    to anything whose base style (everything before the first dash) matches.
+    Uses _extract_base_style() so callers can pass either base or full SKUs.
     """
-    base = style.strip().upper().split('-')[0]
+    base = _extract_base_style(style)
     # Match SKUs whose base style equals `base`. Indexed via the sku column.
     rows = Allocation.query.filter(Allocation.sku.like(f'{base}%')).all()
     # Final filter in Python — handles edge cases where SKU starts with `base`
-    # but isn't actually the same base style (rare but possible)
-    filtered = [r.to_dict() for r in rows if r.sku.split('-')[0] == base]
+    # but isn't actually the same base style (rare but possible).
+    filtered = [r.to_dict() for r in rows if _extract_base_style(r.sku) == base]
     # Pull the ledger row to also include current committed/allocated totals
-    ledger_row = Ledger.query.get(base)
+    ledger_row = db_session.get(Ledger, base)
     return jsonify({
         'style': base,
         'allocations': filtered,
@@ -1157,9 +1218,9 @@ def get_productions_for_style(style):
     Return all production rows for a given base style. View-only — frontend
     just renders this for context, never modifies the ledger from it.
     """
-    base = style.strip().upper().split('-')[0]
+    base = _extract_base_style(style)
     rows = Production.query.filter(Production.style.like(f'{base}%')).all()
-    filtered = [r.to_dict() for r in rows if r.style.split('-')[0] == base]
+    filtered = [r.to_dict() for r in rows if _extract_base_style(r.style) == base]
     # Sort by ETD ascending (earliest first), pushing rows with no ETD to the end
     filtered.sort(key=lambda r: (r.get('etd') is None, r.get('etd') or ''))
     return jsonify({
@@ -1176,7 +1237,7 @@ def get_open_orders_for_style(style):
     Return open-order rows for a given base style, plus pre-aggregated
     per-customer totals (the data the "A2000 Breakdown" view needs).
     """
-    base = style.strip().upper().split('-')[0]
+    base = _extract_base_style(style)
     # All rows are stored at the base-style level (we strip size during sync)
     rows = OpenOrder.query.filter(OpenOrder.style == base).all()
     raw = [r.to_dict() for r in rows]
