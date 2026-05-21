@@ -662,33 +662,62 @@ def run_full_sync():
         r = requests.get(oo_url, timeout=60)
         r.raise_for_status()
         data = r.json()
-        rows = data.get('orders') or data if isinstance(data, list) else []
+
+        # Pick the rows array out of the response. Order matters: try the most
+        # likely keys first, then fall back to "data is itself a list".
+        # The previous version had operator-precedence bug that always returned []
+        # when data was a dict (which is the typical case).
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = (data.get('orders')
+                    or data.get('items')
+                    or data.get('rows')
+                    or data.get('data')
+                    or [])
+        else:
+            rows = []
+
+        # Diagnostic: log the response shape on every sync so we can spot
+        # upstream changes without having to re-add logging.
+        if rows:
+            sample = rows[0] if rows else {}
+            log.info(f'    open_orders: upstream returned {len(rows)} rows. '
+                     f'Sample keys: {sorted(sample.keys()) if isinstance(sample, dict) else type(sample).__name__}')
+        else:
+            top_keys = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
+            log.warning(f'    open_orders: upstream returned NO rows. '
+                        f'Response top-level shape: {top_keys}')
+
         OpenOrder.query.delete()
         now = dt.datetime.utcnow()
         added = 0
         skipped = 0
+        skipped_reasons = {'no_style': 0, 'zero_qty': 0}
         for o in rows:
-            # The open-orders API may return `style` or `baseStyle`. Both can be
-            # full SKUs (with size suffix) so we strip to the base style.
-            raw_style = str(o.get('style', '') or o.get('baseStyle', '') or '').upper().strip()
+            if not isinstance(o, dict):
+                skipped += 1
+                continue
+            # The open-orders API may return `style` or `baseStyle`. Either can
+            # be a full SKU (with size suffix) or already-base. Store as-is so
+            # the per-style lookup uses whatever key upstream provides.
+            raw_style = str(o.get('style', '') or o.get('baseStyle', '') or o.get('sku', '') or '').upper().strip()
             if not raw_style:
                 skipped += 1
-                continue
-            base_style = _extract_base_style(raw_style)
-            if not base_style:
-                skipped += 1
+                skipped_reasons['no_style'] += 1
                 continue
             try:
-                open_qty = int(o.get('openQty') or 0)
+                open_qty = int(float(o.get('openQty') or o.get('open_qty') or 0))
             except (ValueError, TypeError):
                 open_qty = 0
             try:
-                pick_qty = int(o.get('pickQty') or 0)
+                pick_qty = int(float(o.get('pickQty') or o.get('pick_qty') or 0))
             except (ValueError, TypeError):
                 pick_qty = 0
             # Skip empty rows so the table doesn't bloat with 0-qty noise
             if open_qty == 0 and pick_qty == 0:
                 skipped += 1
+                skipped_reasons['zero_qty'] += 1
                 continue
             # PO identifier: existing platform tries 5 different keys, mirror that
             po = (o.get('po') or o.get('poNumber') or o.get('customerPO')
@@ -697,8 +726,14 @@ def run_full_sync():
             # Date fields — multiple aliases as in existing platform
             start = o.get('startDate') or o.get('start_date') or o.get('shipDate')
             cancel = o.get('cancelDate') or o.get('cancel_date') or o.get('endDate')
+            # IMPORTANT: store the SKU AS PROVIDED, not as a base style. Earlier
+            # versions called _extract_base_style() which mangled SKUs whose
+            # upstream key wasn't a true size variant — we'd write
+            # 'TJNASU345SLP-BULK' as 'TJNASU345SL' and the per-style lookup
+            # would miss. Storing as-is also means we match the frontend's
+            # decision to keep full SKUs in the ledger.
             db_session.add(OpenOrder(
-                style=base_style[:64],
+                style=raw_style[:64],
                 customer=customer[:64] if customer else None,
                 po=str(po)[:128] if po else None,
                 open_qty=open_qty,
@@ -710,11 +745,12 @@ def run_full_sync():
             added += 1
         db_session.commit()
         _stamp_sync('open_orders', 'ok', rows=added)
-        log.info(f'  ✓ open_orders: {added} rows replaced ({skipped} skipped as empty)')
+        log.info(f'  ✓ open_orders: {added} rows stored, {skipped} skipped '
+                 f'(no_style={skipped_reasons["no_style"]}, zero_qty={skipped_reasons["zero_qty"]})')
     except Exception as e:
         db_session.rollback()
         _stamp_sync('open_orders', 'error', error=str(e))
-        log.error(f'  ✗ open_orders sync failed: {e}')
+        log.error(f'  ✗ open_orders sync failed: {e}', exc_info=True)
 
 
 def init_db_post():
@@ -1231,12 +1267,34 @@ def get_productions_for_style(style):
 @require_auth
 def get_open_orders_for_style(style):
     """
-    Return open-order rows for a given base style, plus pre-aggregated
-    per-customer totals (the data the "A2000 Breakdown" view needs).
+    Return open-order rows for a given SKU, plus pre-aggregated per-customer
+    totals (the data the "A2000 Breakdown" view needs).
+
+    The lookup is intentionally permissive: we match BOTH the exact SKU the
+    caller asked for AND any SKU whose base style equals the caller's base.
+    This handles cases where the open-orders feed and the ledger disagree on
+    whether to use the full SKU or the base style.
     """
-    base = _extract_base_style(style)
-    # All rows are stored at the base-style level (we strip size during sync)
-    rows = OpenOrder.query.filter(OpenOrder.style == base).all()
+    requested = style.strip().upper()
+    base = _extract_base_style(requested) or requested
+
+    # Two-pass match: exact SKU OR same base style. The latter is a LIKE prefix
+    # match (indexed) then filtered in Python for true base-style equality.
+    exact = OpenOrder.query.filter(OpenOrder.style == requested).all()
+    prefix = OpenOrder.query.filter(OpenOrder.style.like(f'{base}%')).all()
+
+    # Dedupe by row id (some rows match both queries)
+    seen_ids = set()
+    rows = []
+    for r in exact + prefix:
+        if r.id in seen_ids:
+            continue
+        seen_ids.add(r.id)
+        # For the prefix matches, double-check base-style equality so we don't
+        # accidentally include e.g. "FOO1234" when caller asked for "FOO123"
+        if _extract_base_style(r.style) != base and r.style != requested:
+            continue
+        rows.append(r)
     raw = [r.to_dict() for r in rows]
 
     # Aggregate by customer for the breakdown card (one row per customer)
